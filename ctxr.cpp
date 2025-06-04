@@ -1,3 +1,16 @@
+/*
+ * CATL Transaction Extractor
+ * 
+ * Extracts transactions from XRPL/Xahau catalogue (CATL) files.
+ * 
+ * Features:
+ * - Streaming from HTTP sources or local files
+ * - Automatic resume capability
+ * - Organized output: 100,000 ledgers per directory
+ * - Directory naming: 8-digit zero-padded for proper sorting
+ * - Supports compressed and uncompressed catalogues
+ */
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -266,6 +279,10 @@ private:
     uint8_t compressionLevel_ = 0;
     uint16_t networkId_;
     
+    // Output directory configuration
+    std::string outputBaseDir_ = "transactions";
+    static constexpr uint32_t LEDGERS_PER_DIR = 100000; // 100K ledgers per directory
+    
     // Statistics
     size_t totalTransactions_ = 0;
     size_t skippedTransactions_ = 0;
@@ -286,6 +303,30 @@ private:
     
     inline uint8_t getCompressionLevel(uint16_t versionField) {
         return (versionField & CATALOGUE_COMPRESS_LEVEL_MASK) >> 8;
+    }
+    
+    std::string getLedgerDirectory(uint32_t ledger) {
+        // Create a directory structure like: transactions/00000000-00099999/
+        // Using 8-digit padding to ensure proper sorting up to ledger 99,999,999
+        uint32_t dirStart = (ledger / LEDGERS_PER_DIR) * LEDGERS_PER_DIR;
+        uint32_t dirEnd = dirStart + LEDGERS_PER_DIR - 1;
+        
+        std::stringstream ss;
+        ss << outputBaseDir_ << "/" 
+           << std::setfill('0') << std::setw(8) << dirStart 
+           << "-" 
+           << std::setfill('0') << std::setw(8) << dirEnd;
+        return ss.str();
+    }
+    
+    bool ensureDirectoryExists(const std::string& path) {
+        try {
+            fs::create_directories(path);
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR: Failed to create directory " << path << ": " << e.what() << std::endl;
+            return false;
+        }
     }
     
     std::string constructCTID(uint32_t ledger, uint32_t txIndex) {
@@ -407,6 +448,7 @@ private:
         }
         
         uint32_t currentTxIndex = 0;
+        std::string currentLedgerDir;
         
         while (!stream.eof()) {
             uint8_t nodeType;
@@ -446,12 +488,21 @@ private:
                     continue;
                 }
                 
-                // Construct CTID
+                // Ensure directory exists for this ledger (only check once per ledger)
+                if (currentLedgerDir.empty()) {
+                    currentLedgerDir = getLedgerDirectory(ledgerSeq);
+                    if (!ensureDirectoryExists(currentLedgerDir)) {
+                        std::cerr << "\nERROR: Failed to create directory for ledger " << ledgerSeq << std::endl;
+                        return false;
+                    }
+                }
+                
+                // Construct CTID and full path
                 std::string ctid = constructCTID(ledgerSeq, txIndex);
-                std::string filename = ctid + ".hex";
+                std::string filepath = currentLedgerDir + "/" + ctid + ".hex";
                 
                 // Check if file already exists
-                if (fs::exists(filename)) {
+                if (fs::exists(filepath)) {
                     skippedTransactions_++;
                     if (!skipBytes(stream, dataSize)) return false;
                 } else {
@@ -461,7 +512,7 @@ private:
                     if (stream.gcount() < static_cast<std::streamsize>(dataSize)) return false;
                     
                     // Save to file in hex format
-                    std::ofstream outFile(filename);
+                    std::ofstream outFile(filepath);
                     if (outFile.is_open()) {
                         for (uint8_t byte : txData) {
                             outFile << std::hex << std::setw(2) << std::setfill('0') 
@@ -470,7 +521,7 @@ private:
                         outFile.close();
                         totalTransactions_++;
                     } else {
-                        std::cerr << "\nERROR: Failed to create file: " << filename << std::endl;
+                        std::cerr << "\nERROR: Failed to create file: " << filepath << std::endl;
                     }
                 }
                 
@@ -498,6 +549,9 @@ private:
     void checkForResume() {
         std::cout << "Checking for existing CTID files..." << std::endl;
         
+        // Ensure base directory exists
+        ensureDirectoryExists(outputBaseDir_);
+        
         // Pattern to match CTID files for this network
         std::stringstream pattern;
         pattern << "C[0-9A-F]{7}[0-9A-F]{4}" 
@@ -509,22 +563,27 @@ private:
         uint32_t maxTxIndex = 0;
         std::string latestFile;
         
-        for (const auto& entry : fs::directory_iterator(fs::current_path())) {
-            if (entry.is_regular_file()) {
-                std::string filename = entry.path().filename().string();
-                if (std::regex_match(filename, ctidRegex)) {
-                    std::string ctid = filename.substr(0, 16);
-                    auto [ledger, txIndex] = parseCTID(ctid);
-                    
-                    if (ledger > maxLedger || (ledger == maxLedger && txIndex > maxTxIndex)) {
-                        maxLedger = ledger;
-                        maxTxIndex = txIndex;
-                        latestFile = filename;
+        // Scan all subdirectories
+        try {
+            for (const auto& dirEntry : fs::recursive_directory_iterator(outputBaseDir_)) {
+                if (dirEntry.is_regular_file()) {
+                    std::string filename = dirEntry.path().filename().string();
+                    if (std::regex_match(filename, ctidRegex)) {
+                        std::string ctid = filename.substr(0, 16);
+                        auto [ledger, txIndex] = parseCTID(ctid);
+                        
+                        if (ledger > maxLedger || (ledger == maxLedger && txIndex > maxTxIndex)) {
+                            maxLedger = ledger;
+                            maxTxIndex = txIndex;
+                            latestFile = filename;
+                        }
+                        
+                        skippedTransactions_++;
                     }
-                    
-                    skippedTransactions_++;
                 }
             }
+        } catch (const std::exception& e) {
+            std::cout << "Note: Error scanning directories: " << e.what() << std::endl;
         }
         
         if (!latestFile.empty()) {
@@ -551,8 +610,8 @@ private:
     }
     
 public:
-    TransactionExtractor(const std::string& source) 
-        : source_(source) {
+    TransactionExtractor(const std::string& source, const std::string& outputDir = "transactions") 
+        : source_(source), outputBaseDir_(outputDir) {
         startTime_ = std::chrono::steady_clock::now();
         
         // Check if source is HTTP(S)
@@ -610,12 +669,14 @@ public:
         
         std::cout << "=== CATL Transaction Extractor ===" << std::endl;
         std::cout << "Source: " << source_ << std::endl;
+        std::cout << "Output directory: " << outputBaseDir_ << std::endl;
         std::cout << "Network ID: " << std::hex << networkId_ << std::dec << std::endl;
         std::cout << "Ledger range: " << header_.min_ledger << " - " << header_.max_ledger << std::endl;
         std::cout << "Compression level: " << static_cast<int>(compressionLevel_) << std::endl;
         if (!isHttpSource_ && header_.filesize > 0) {
             std::cout << "File size: " << (header_.filesize / 1024 / 1024) << " MB" << std::endl;
         }
+        std::cout << "Organization: " << LEDGERS_PER_DIR << " ledgers per directory" << std::endl;
         std::cout << std::endl;
         
         // Check for existing files to resume
@@ -746,27 +807,56 @@ public:
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <source> [source2] ..." << std::endl;
+        std::cerr << "Usage: " << argv[0] << " [options] <source> [source2] ..." << std::endl;
         std::cerr << "\nExtracts transactions from XRPL catalogue files." << std::endl;
         std::cerr << "Sources can be local files or HTTP(S) URLs." << std::endl;
+        std::cerr << "\nOptions:" << std::endl;
+        std::cerr << "  -o <dir>    Output directory (default: transactions)" << std::endl;
         std::cerr << "\nExamples:" << std::endl;
         std::cerr << "  " << argv[0] << " catalogue.dat" << std::endl;
-        std::cerr << "  " << argv[0] << " https://example.com/catalogue.dat" << std::endl;
+        std::cerr << "  " << argv[0] << " -o mydata https://example.com/catalogue.dat" << std::endl;
         std::cerr << "  " << argv[0] << " file1.dat https://example.com/file2.dat file3.dat" << std::endl;
-        std::cerr << "\nSupports automatic resume functionality and streaming from HTTP sources." << std::endl;
+        std::cerr << "\nOutput Structure:" << std::endl;
+        std::cerr << "  Transactions are organized in directories by ledger range:" << std::endl;
+        std::cerr << "  <output_dir>/00000000-00099999/  (ledgers 0-99,999)" << std::endl;
+        std::cerr << "  <output_dir>/00100000-00199999/  (ledgers 100,000-199,999)" << std::endl;
+        std::cerr << "  <output_dir>/00200000-00299999/  (ledgers 200,000-299,999)" << std::endl;
+        std::cerr << "  etc." << std::endl;
+        std::cerr << "\nSupports automatic resume functionality." << std::endl;
+        return 1;
+    }
+    
+    std::string outputDir = "transactions";
+    std::vector<std::string> sources;
+    
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "-o" && i + 1 < argc) {
+            outputDir = argv[++i];
+        } else if (arg[0] != '-') {
+            sources.push_back(arg);
+        } else {
+            std::cerr << "Unknown option: " << arg << std::endl;
+            return 1;
+        }
+    }
+    
+    if (sources.empty()) {
+        std::cerr << "Error: No source files specified" << std::endl;
         return 1;
     }
     
     // Process each source
-    for (int i = 1; i < argc; i++) {
+    for (size_t i = 0; i < sources.size(); i++) {
         std::cout << "\n";
-        if (i > 1) {
+        if (i > 0) {
             std::cout << "=====================================\n";
         }
         
-        TransactionExtractor extractor(argv[i]);
+        TransactionExtractor extractor(sources[i], outputDir);
         if (!extractor.extract()) {
-            std::cerr << "Failed to process: " << argv[i] << std::endl;
+            std::cerr << "Failed to process: " << sources[i] << std::endl;
             continue;
         }
     }
