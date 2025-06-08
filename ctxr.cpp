@@ -65,7 +65,7 @@ struct CATLHeader {
 };
 #pragma pack(pop)
 
-// Custom streambuf for CURL that provides buffering
+// Custom streambuf for CURL with continuous buffer (no data loss)
 class CurlStreamBuf : public std::streambuf {
 private:
   CURL *curl_;
@@ -74,11 +74,10 @@ private:
   std::atomic<bool> error_{false};
   std::thread downloadThread_;
 
-  // Circular buffer
-  static constexpr size_t BUFFER_SIZE = 1024 * 1024; // 1MB buffer
+  // Single continuous buffer that only grows
   std::vector<char> buffer_;
-  std::atomic<size_t> writePos_{0};
-  std::atomic<size_t> readPos_{0};
+  std::atomic<size_t> writePos_{0}; // Where CURL writes next
+  std::atomic<size_t> readPos_{0};  // Where we read from next
   std::mutex mutex_;
   std::condition_variable dataAvailable_;
   std::condition_variable spaceAvailable_;
@@ -87,9 +86,16 @@ private:
   std::atomic<size_t> totalBytesReceived_{0};
   std::atomic<double> downloadSpeed_{0.0};
 
-  // Internal read buffer for streambuf
-  static constexpr size_t READ_BUFFER_SIZE = 8192;
-  std::vector<char> readBuffer_;
+  // Internal buffer for streambuf
+  static constexpr size_t STREAMBUF_SIZE = 8192;
+  std::vector<char> streambufBuffer_;
+
+  // Growth settings
+  static constexpr size_t INITIAL_SIZE = 10 * 1024 * 1024; // 10MB initial
+  static constexpr size_t MAX_SIZE =
+      100 * 1024 * 1024; // 100MB max before compaction
+  static constexpr size_t COMPACT_THRESHOLD =
+      50 * 1024 * 1024; // Compact when 50MB is read
 
   static size_t writeCallback(char *ptr, size_t size, size_t nmemb,
                               void *userdata) {
@@ -121,35 +127,42 @@ private:
 
     size_t written = 0;
     while (written < size && downloading_) {
-      size_t writeP = writePos_.load();
-      size_t readP = readPos_.load();
+      size_t currentWritePos = writePos_.load();
+      size_t currentReadPos = readPos_.load();
 
-      // Calculate available space
-      size_t available = (readP + BUFFER_SIZE - writeP - 1) % BUFFER_SIZE;
-
-      if (available == 0) {
-        // Buffer full, wait for space
-        spaceAvailable_.wait_for(lock, std::chrono::milliseconds(100));
-        continue;
+      // Ensure we have space
+      if (currentWritePos + (size - written) > buffer_.size()) {
+        // Need to grow buffer or compact it
+        if (currentReadPos > COMPACT_THRESHOLD && buffer_.size() > MAX_SIZE) {
+          // Compact: move unread data to beginning
+          size_t unreadSize = currentWritePos - currentReadPos;
+          std::memmove(buffer_.data(), buffer_.data() + currentReadPos,
+                       unreadSize);
+          writePos_ = unreadSize;
+          readPos_ = 0;
+          currentWritePos = unreadSize;
+          currentReadPos = 0;
+        } else {
+          // Grow buffer
+          size_t newSize =
+              std::max(buffer_.size() * 2, currentWritePos + (size - written));
+          if (newSize > MAX_SIZE * 2) {
+            // Emergency: buffer is getting too large
+            std::cerr
+                << "\nWARNING: Buffer size exceeding limits. Read position: "
+                << currentReadPos << ", Write position: " << currentWritePos
+                << std::endl;
+          }
+          buffer_.resize(newSize);
+        }
       }
 
-      // Write as much as we can
-      size_t toWrite = std::min(size - written, available);
-      size_t endPos = (writeP + toWrite) % BUFFER_SIZE;
-
-      if (endPos > writeP) {
-        // Simple copy
-        std::memcpy(&buffer_[writeP], data + written, toWrite);
-      } else {
-        // Wrap around
-        size_t firstPart = BUFFER_SIZE - writeP;
-        std::memcpy(&buffer_[writeP], data + written, firstPart);
-        std::memcpy(&buffer_[0], data + written + firstPart,
-                    toWrite - firstPart);
-      }
-
-      writePos_ = endPos;
+      // Write data
+      size_t toWrite = size - written;
+      std::memcpy(buffer_.data() + currentWritePos, data + written, toWrite);
+      writePos_ = currentWritePos + toWrite;
       written += toWrite;
+
       dataAvailable_.notify_one();
     }
 
@@ -172,57 +185,40 @@ private:
       return traits_type::to_int_type(*gptr());
     }
 
-    // Try to read more data
     std::unique_lock<std::mutex> lock(mutex_);
 
-    size_t bytesRead = 0;
-    while (bytesRead == 0) {
-      size_t writeP = writePos_.load();
-      size_t readP = readPos_.load();
+    while (true) {
+      size_t currentWritePos = writePos_.load();
+      size_t currentReadPos = readPos_.load();
 
-      // Calculate available data
-      size_t available = (writeP + BUFFER_SIZE - readP) % BUFFER_SIZE;
+      if (currentReadPos < currentWritePos) {
+        // We have data available
+        size_t available = currentWritePos - currentReadPos;
+        size_t toRead = std::min(available, STREAMBUF_SIZE);
 
-      if (available == 0) {
-        if (!downloading_ || error_) {
-          // No more data
-          return traits_type::eof();
-        }
-        // Wait for data
-        dataAvailable_.wait_for(lock, std::chrono::milliseconds(100));
-        continue;
+        std::memcpy(streambufBuffer_.data(), buffer_.data() + currentReadPos,
+                    toRead);
+        readPos_ = currentReadPos + toRead;
+
+        setg(streambufBuffer_.data(), streambufBuffer_.data(),
+             streambufBuffer_.data() + toRead);
+
+        return traits_type::to_int_type(*gptr());
       }
 
-      // Read as much as we can into our buffer
-      size_t toRead = std::min(available, READ_BUFFER_SIZE);
-      size_t endPos = (readP + toRead) % BUFFER_SIZE;
-
-      if (endPos > readP) {
-        // Simple copy
-        std::memcpy(readBuffer_.data(), &buffer_[readP], toRead);
-      } else {
-        // Wrap around
-        size_t firstPart = BUFFER_SIZE - readP;
-        std::memcpy(readBuffer_.data(), &buffer_[readP], firstPart);
-        std::memcpy(readBuffer_.data() + firstPart, &buffer_[0],
-                    toRead - firstPart);
+      // No data available
+      if (!downloading_ || error_) {
+        return traits_type::eof();
       }
 
-      readPos_ = endPos;
-      bytesRead = toRead;
-      spaceAvailable_.notify_one();
+      // Wait for more data
+      dataAvailable_.wait_for(lock, std::chrono::milliseconds(100));
     }
-
-    // Set buffer pointers
-    setg(readBuffer_.data(), readBuffer_.data(),
-         readBuffer_.data() + bytesRead);
-
-    return traits_type::to_int_type(*gptr());
   }
 
 public:
   CurlStreamBuf(const std::string &url)
-      : url_(url), buffer_(BUFFER_SIZE), readBuffer_(READ_BUFFER_SIZE) {
+      : url_(url), buffer_(INITIAL_SIZE), streambufBuffer_(STREAMBUF_SIZE) {
     curl_ = curl_easy_init();
     if (!curl_) {
       throw std::runtime_error("Failed to initialize CURL");
@@ -240,7 +236,8 @@ public:
     curl_easy_setopt(curl_, CURLOPT_BUFFERSIZE, 120000L);
 
     // Initialize streambuf
-    setg(readBuffer_.data(), readBuffer_.data(), readBuffer_.data());
+    setg(streambufBuffer_.data(), streambufBuffer_.data(),
+         streambufBuffer_.data());
 
     // Start download thread
     downloadThread_ = std::thread(&CurlStreamBuf::downloadThread, this);
@@ -459,100 +456,9 @@ private:
     uint32_t currentTxIndex = 0;
     std::string currentLedgerDir;
 
-    // Lambda to find end of XRPL object
-    auto findObjectEnd = [](const uint8_t *data, size_t size) -> size_t {
-      size_t pos = 0;
-      while (pos < size) {
-        uint8_t b = data[pos];
-        int type, field, header = 1;
-
-        if (b == 0) {
-          if (pos + 2 >= size)
-            return size;
-          type = data[pos + 1];
-          field = data[pos + 2];
-          header = 3;
-        } else if ((b >> 4) == 0) {
-          if (pos + 1 >= size)
-            return size;
-          field = b & 0x0F;
-          type = data[pos + 1];
-          header = 2;
-        } else if ((b & 0x0F) == 0) {
-          if (pos + 1 >= size)
-            return size;
-          type = b >> 4;
-          field = data[pos + 1];
-          header = 2;
-        } else {
-          type = b >> 4;
-          field = b & 0x0F;
-        }
-
-        pos += header;
-
-        // End of object marker
-        if ((type == 14 || type == 15) && field == 1)
-          return pos;
-
-        // Skip field data
-        size_t skip = 0;
-        switch (type) {
-        case 1:
-          skip = 2;
-          break;
-        case 2:
-          skip = 4;
-          break;
-        case 3:
-          skip = 8;
-          break;
-        case 4:
-          skip = 16;
-          break;
-        case 5:
-          skip = 32;
-          break;
-        case 8:
-          skip = 21;
-          break;
-        case 16:
-          skip = 1;
-          break;
-        case 17:
-          skip = 20;
-          break;
-        case 6:
-          skip = (pos < size && (data[pos] & 0x80)) ? 48 : 8;
-          break;
-        case 7:
-        case 19: {
-          if (pos >= size)
-            return size;
-          size_t vl = data[pos];
-          if (vl <= 192)
-            skip = 1 + vl;
-          else if (vl <= 240) {
-            if (pos + 1 >= size)
-              return size;
-            skip = 2 + 193 + ((vl - 193) * 256) + data[pos + 1];
-          } else {
-            if (pos + 2 >= size)
-              return size;
-            skip = 3 + 12481 + ((vl - 241) * 65535) + (data[pos + 1] * 256) +
-                   data[pos + 2];
-          }
-          break;
-        }
-        case 18:
-          while (pos < size && data[pos++] != 0x00)
-            ;
-          continue;
-        }
-        pos += skip;
-      }
-      return size;
-    };
+    // Add debug counter
+    int debugCount = 0;
+    const int DEBUG_LIMIT = 20; // Only debug first 20 transactions
 
     while (!stream.eof()) {
       uint8_t nodeType;
@@ -613,25 +519,28 @@ private:
           if (stream.gcount() < static_cast<std::streamsize>(dataSize))
             return false;
 
-          std::vector<uint8_t> output;
+          uint64_t size = 0;
 
-          if (nodeType == tnTRANSACTION_NM) {
-            output = std::move(txData);
+          if (txData.size() < 3)
+            continue;
+
+          if (txData[0] < 192) {
+            size = txData[0];
+            txData.erase(txData.begin());
+          } else if (txData[0] < 241) {
+            size = 193 + ((txData[0] - 193) * 256) + txData[1];
+            txData.erase(txData.begin(), txData.begin() + 2);
           } else {
-            // tnTRANSACTION_MD: remove tag and extract just transaction
-            if (txData.size() < 32) {
-              std::cerr << "\nERROR: TXN_MD data too small\n";
-              return false;
-            }
-            size_t endPos = findObjectEnd(txData.data(), txData.size() - 32);
-            output.assign(txData.begin(),
-                          txData.begin() +
-                              std::min(endPos, txData.size() - 32));
+            size = 12481 + ((txData[0] - 241) * 65536) + (txData[1] * 256) +
+                   txData[2];
+            txData.erase(txData.begin(), txData.begin() + 3);
           }
+
+          std::cout << "VL size: " << size << "\n";
 
           std::ofstream outFile(filepath);
           if (outFile.is_open()) {
-            for (uint8_t byte : output) {
+            for (uint8_t byte : txData) {
               outFile << std::hex << std::setw(2) << std::setfill('0')
                       << static_cast<int>(byte);
             }
