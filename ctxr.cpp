@@ -456,10 +456,6 @@ private:
     uint32_t currentTxIndex = 0;
     std::string currentLedgerDir;
 
-    // Add debug counter
-    int debugCount = 0;
-    const int DEBUG_LIMIT = 20; // Only debug first 20 transactions
-
     while (!stream.eof()) {
       uint8_t nodeType;
       stream.read(reinterpret_cast<char *>(&nodeType), 1);
@@ -536,7 +532,8 @@ private:
             txData.erase(txData.begin(), txData.begin() + 3);
           }
 
-          std::cout << "VL size: " << size << "\n";
+          if (txData.size() > size)
+              txData.resize(size);
 
           std::ofstream outFile(filepath);
           if (outFile.is_open()) {
